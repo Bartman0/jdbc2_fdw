@@ -16,6 +16,7 @@
 
 #include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "access/table.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/vacuum.h"
@@ -30,14 +31,14 @@
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
-#include "optimizer/var.h"
+#include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/elog.h"
-
+#include "utils/float.h"
 
 #include "storage/ipc.h"
 #include "catalog/pg_foreign_server.h"
@@ -466,7 +467,7 @@ jdbcGetForeignRelSize(PlannerInfo *root,
      * columns used in them.  Doesn't seem worth detecting that case though.)
      */
     fpinfo->attrs_used = NULL;
-    pull_varattnos((Node *) baserel->reltargetlist, baserel->relid,
+    pull_varattnos((Node *) baserel->reltarget, baserel->relid,
                    &fpinfo->attrs_used);
     foreach(lc, fpinfo->local_conds)
     {
@@ -509,7 +510,7 @@ jdbcGetForeignRelSize(PlannerInfo *root,
 
         /* Report estimated baserel size to planner. */
         baserel->rows = fpinfo->rows;
-        baserel->width = fpinfo->width;
+        baserel->reltarget->width = fpinfo->width;
     }
     else
     {
@@ -526,7 +527,7 @@ jdbcGetForeignRelSize(PlannerInfo *root,
         {
             baserel->pages = 10;
             baserel->tuples =
-                (10 * BLCKSZ) / (baserel->width + sizeof(HeapTupleHeaderData));
+                (10 * BLCKSZ) / (baserel->reltarget->width + sizeof(HeapTupleHeaderData));
         }
 
         /* Estimate baserel size as best we can with local statistics. */
@@ -649,7 +650,7 @@ jdbcGetForeignPlan(PlannerInfo *root,
 		appendWhereClause(&sql, root, baserel, remote_conds,
 		true, &params_list);
 	}
-    ereport(DEBUG3, (errmsg("SQL: %s",sql.data)));
+    ereport(DEBUG3, (errmsg("SQL: %s", sql.data)));
     /*
      * Add FOR UPDATE/SHARE if appropriate.  We apply locking during the
      * initial row fetch, rather than later on as is done for local tables.
@@ -691,6 +692,9 @@ jdbcGetForeignPlan(PlannerInfo *root,
                 case LCS_FORNOKEYUPDATE:
                 case LCS_FORUPDATE:
                     appendStringInfoString(&sql, " FOR UPDATE");
+                    break;
+                default:
+                    elog(ERROR, "unexpected row clause: %d", (int) rc->strength);
                     break;
             }
         }
@@ -1003,7 +1007,7 @@ postgresPlanForeignModify(PlannerInfo *root,
      * Core code already has some lock on each rel being planned, so we can
      * use NoLock here.
      */
-    rel = heap_open(rte->relid, NoLock);
+    rel = table_open(rte->relid, NoLock);
 
     /*
      * In an INSERT, we transmit all columns that are defined in the foreign
@@ -1027,7 +1031,7 @@ postgresPlanForeignModify(PlannerInfo *root,
     }
     else if (operation == CMD_UPDATE)
     {
-        Bitmapset  *tmpset = bms_copy(rte->modifiedCols);
+        Bitmapset  *tmpset = bms_copy(rte->updatedCols);
         AttrNumber  col;
 
         while ((col = bms_first_member(tmpset)) >= 0)
@@ -1070,7 +1074,7 @@ postgresPlanForeignModify(PlannerInfo *root,
             break;
     }
 
-    heap_close(rel, NoLock);
+    table_close(rel, NoLock);
 
     /*
      * Build the fdw_private list that will be available to the executor.
@@ -1615,7 +1619,7 @@ estimate_path_cost_size(PlannerInfo *root,
 
         /* Use rows/width estimates made by set_baserel_size_estimates. */
         rows = baserel->rows;
-        width = baserel->width;
+        width = baserel->reltarget->width;
 
         /*
          * Back into an estimate of the number of retrieved rows.  Just in
@@ -1778,7 +1782,7 @@ create_cursor(ForeignScanState *node)
             bool        isNull;
 
             /* Evaluate the parameter expression */
-            expr_value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
+            expr_value = ExecEvalExpr(expr_state, econtext, &isNull);
 
             /*
              * Get string representation of each parameter value by invoking
@@ -2110,7 +2114,7 @@ store_returning_result(PgFdwModifyState *fmstate,
                                             fmstate->retrieved_attrs,
                                             fmstate->temp_cxt);
         /* tuple will be deleted when it is cleared from the slot */
-        ExecStoreTuple(newtup, slot, InvalidBuffer, true);
+        ExecStoreHeapTuple(newtup, slot, true);
     }
     PG_CATCH();
     {
